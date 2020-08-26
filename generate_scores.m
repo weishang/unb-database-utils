@@ -1,13 +1,15 @@
 clear; clc; close all;
 
-load_configs; 
+load_configs;
+
+addpath('./common');
 
 recordings = readtable(protocol_file);
 
 clients = cell2mat(recordings.client_id);
 unique_clients = unique(clients);
 
-phrases = cell2mat(recordings.phrase_id); 
+phrases = cell2mat(recordings.phrase_id);
 unique_phrases = unique(phrases);
 
 
@@ -25,10 +27,10 @@ for cur_client_ind = 1:num_clients
         cur_client = unique_clients(cur_client_ind);
         cur_phrase = unique_phrases(cur_phrase_ind);
         
-        cap_set = struct; 
+        cap_set = struct;
         
-        cap_set.client = cur_client; 
-        cap_set.phrase = cur_phrase; 
+        cap_set.client = cur_client;
+        cap_set.phrase = cur_phrase;
         
         cap_set.stored_recordings = get_recording_ids(recordings, cur_client,...
             cur_phrase, 'stored', '', '');
@@ -37,11 +39,11 @@ for cur_client_ind = 1:num_clients
         cap_set.authentic_recordings = get_recording_ids(recordings, cur_client,...
             cur_phrase, 'authentic', '', '');
         
-        cap_set.playback_scores = compute_scores(feature_folder, cap_set.playback_recordings, cap_set.stored_recordings); 
-        cap_set.authentic_scores = compute_scores(feature_folder, cap_set.authentic_recordings, cap_set.stored_recordings); 
+        cap_set.playback_scores = compute_scores(feature_folder, cap_set.playback_recordings, cap_set.stored_recordings);
+        cap_set.authentic_scores = compute_scores(feature_folder, cap_set.authentic_recordings, cap_set.stored_recordings);
         
         
-        set_num = set_num + 1; 
+        set_num = set_num + 1;
         cap_sets{set_num} = cap_set;
         
     end
