@@ -1,1 +1,9 @@
 results.mat
+results.pkl
+.results_version
+__pycache__/
+*.pyc
+metadata.csv
+data/
+features/
+*.pdf
