@@ -24,7 +24,9 @@ SIGNIFICANCE_RATIO = 0.02   # condition (i): 2% of (34 dB below) the frame's hig
 MIN_PEAK_SEPARATION = 4     # condition (ii): bins
 LOCAL_DOMINANCE_HALF_WIDTH = 2   # condition (iii): dominant within a centered 5-bin window
 LSM_TOP_N = 5
-MIN_SPEECH_RUN = 10
+SPEECH_LOW = 0.2    # a valid speech/non-speech valley's LSM-CDF must exceed this
+SPEECH_HIGH = 0.7   # ...and stay under this
+MIN_SPEECH_RUN = 8
 MIN_TRACK_LENGTH = 5
 TRACK_FREQ_MIN = 300
 TRACK_FREQ_MAX = 3000
@@ -41,20 +43,34 @@ def _frame_signal(data):
 
 def _frame_magnitudes(frames):
     window = np.hamming(FRAME_SIZE)
-    spectra = np.fft.rfft(frames * window, n=NFFT, axis=1)
+    window = window / window.sum()  # matches the reference's HW normalization
+    windowed = frames * window
+    # No DC/mean removal: find_stft.m (the reference's later, superseding
+    # feature-extraction pipeline) windows and FFTs directly, with no mean
+    # subtraction step at all.
+    spectra = np.fft.rfft(windowed, n=NFFT, axis=1)
     return np.abs(spectra)[:, :N_BINS]  # drop the Nyquist bin, per report
 
 
 def _select_frame_peaks(magnitude):
     """Stage 1: return selected peaks for one frame as a list of (bin, mag),
     sorted by descending magnitude."""
-    interior = np.arange(1, N_BINS - 1)
+    # detect_peaks.m (the reference's later pipeline) circshifts the frame by
+    # 2 bins and additionally skips shifted-index <= 5 before applying the
+    # same (2, 253) range check used by the older get_voicedTracks.m -- net
+    # effect, converted back to this module's true-bin/0-based convention:
+    # candidates are restricted to bins [3, 249] instead of [2, 251].
+    interior = np.arange(3, N_BINS - 6)
     is_local_max = (magnitude[interior] > magnitude[interior - 1]) & (magnitude[interior] > magnitude[interior + 1])
     candidates = interior[is_local_max]
     if len(candidates) == 0:
         return []
 
-    order = np.argsort(magnitude[candidates])[::-1]
+    # Stable descending sort (MATLAB's sort(...,'descend') preserves the
+    # original -- here, ascending-bin -- order among tied magnitudes;
+    # argsort()[::-1] would instead reverse it, and the default 'quicksort'
+    # kind isn't stable to begin with).
+    order = np.argsort(-magnitude[candidates], kind="stable")
     candidates = candidates[order]
 
     threshold = SIGNIFICANCE_RATIO * magnitude[candidates[0]]
@@ -75,7 +91,13 @@ def _select_frame_peaks(magnitude):
 
         selected.append((int(b), float(m)))
 
-    return selected
+    # The reference stores each peak's bin as (true local-max position) + 1
+    # -- a leftover of its two-stage index derivation (find(...)+1 to get the
+    # true position, then +1 again on the whole array right before storing).
+    # Selection above (threshold/separation/dominance) uses the true
+    # position; only the stored/returned bin carries the extra +1, same as
+    # get_voicedTracks.m lines 125 and 160.
+    return [(b + 1, m) for b, m in selected]
 
 
 def _compute_lsm(peaks):
@@ -87,29 +109,32 @@ def _compute_lsm(peaks):
 
 def _speech_non_speech_threshold(lsm_values):
     n = len(lsm_values)
-    n_bins = int(np.ceil(np.sqrt(n)))
+    n_bins = int(_matlab_round(np.sqrt(n)))
     hist, edges = np.histogram(lsm_values, bins=n_bins)
+    centers = (edges[:-1] + edges[1:]) / 2
 
-    lsm_sorted = np.sort(lsm_values)
+    # Tie-break with a small increasing ramp before the sign-of-diff-of-diff
+    # valley scan, so that flat/plateau runs in the (integer) histogram
+    # counts resolve to a single valley at the start of the lowest plateau,
+    # matching the reference's `N + (0:(num_bins-1))/num_bins` trick.
+    ramped = hist + np.arange(n_bins) / n_bins
+    d = np.diff(np.sign(np.diff(ramped)))
+    valley_idx = np.where(d == 2)[0] + 1  # interior bins only
 
-    def cdf(value):
-        return np.searchsorted(lsm_sorted, value, side="right") / n
+    if len(valley_idx) == 0:
+        return None  # no valley found: all frames are speech
 
-    valleys = []
-    for i in range(1, n_bins - 1):
-        if hist[i] < hist[i - 1] and hist[i] <= hist[i + 1]:
-            valleys.append(edges[i])
+    cdf = np.cumsum(hist) / n
 
-    candidates = [(v, cdf(v)) for v in valleys]
-    in_range = [v for v, c in candidates if 0.2 <= c <= 0.7]
+    in_range = [i for i in valley_idx if SPEECH_LOW < cdf[i] < SPEECH_HIGH]
     if in_range:
-        return min(in_range)
+        return centers[in_range[0]]
 
-    below = [(v, c) for v, c in candidates if c < 0.2]
+    below = [i for i in valley_idx if cdf[i] < SPEECH_LOW]
     if below:
-        return max(below, key=lambda vc: vc[1])[0]
+        return centers[below[-1]]
 
-    return None  # no candidate has cdf < 0.7: all frames are speech
+    return None  # no candidate has cdf < SPEECH_HIGH: all frames are speech
 
 
 def _detect_speech_frames(frame_peaks):
@@ -140,12 +165,21 @@ def _detect_speech_frames(frame_peaks):
     return refined
 
 
+def _matlab_round(x):
+    """MATLAB's round() is half-away-from-zero; Python's builtin round() and
+    np.round() are both half-to-even, which disagrees at exact .5 ties."""
+    return np.sign(x) * np.floor(np.abs(x) + 0.5)
+
+
 def _bin_edges_hz(b, delta_f):
     return (b - 0.5) * delta_f, (b + 0.5) * delta_f
 
 
 def _bin_from_freq(f, delta_f):
-    return int(np.clip(round(f / delta_f), 0, N_BINS - 1))
+    # No clamping to [0, N_BINS-1]: the reference computes this as a plain
+    # numeric bound for a `>=`/`<=` comparison against real peak bins, never
+    # as an array index, so it's never clipped either.
+    return int(_matlab_round(f / delta_f))
 
 
 def _build_tracks(frame_peaks, speech_mask, delta_f):
@@ -215,8 +249,7 @@ def _build_tracks(frame_peaks, speech_mask, delta_f):
             if b not in claimed:
                 open_tracks.append({"points": [(k + 1, b, m)], "last_bin": b})
 
-    finished_tracks.extend(open_tracks)
-    return finished_tracks
+    return finished_tracks, open_tracks
 
 
 def extract_voiced_tracks(data, samplerate):
@@ -241,16 +274,32 @@ def extract_voiced_tracks(data, samplerate):
     magnitude = _frame_magnitudes(frames)
     frame_peaks = [_select_frame_peaks(magnitude[i]) for i in range(n_frames)]
     speech_mask = _detect_speech_frames(frame_peaks)
-    tracks = _build_tracks(frame_peaks, speech_mask, delta_f)
+    tracks, open_at_eof = _build_tracks(frame_peaks, speech_mask, delta_f)
 
     matrix = np.zeros((N_BINS, n_frames), dtype=bool)
     for track in tracks:
         if len(track["points"]) < MIN_TRACK_LENGTH:
             continue
-        avg_freq = np.mean([b for _, b, _ in track["points"]]) * delta_f
+        # build_voicedtracks.m (the reference's later pipeline) computes this
+        # as (mean_bin - 1) * FS/FFTSIZE, not mean_bin * FS/FFTSIZE -- the "-1"
+        # offsets the +1 bin-storage quirk specifically for this frequency
+        # check, without touching the stored/output bin positions themselves.
+        avg_freq = (np.mean([b for _, b, _ in track["points"]]) - 1) * delta_f
         if not (TRACK_FREQ_MIN <= avg_freq <= TRACK_FREQ_MAX):
             continue
         for frame_idx, b, _ in track["points"]:
+            matrix[b, frame_idx] = 1
+
+    # The reference's frame loop (both track construction and matrix output)
+    # stops one frame short of the end (`for frm_num = 1:num_frms-1`), so a
+    # track still open at EOF never reaches the length/frequency filter (only
+    # applied at termination) and its point in the true last frame is never
+    # written to the output matrix. Replicate both quirks: write these
+    # tracks' earlier points unconditionally, dropping only the last-frame one.
+    for track in open_at_eof:
+        for frame_idx, b, _ in track["points"]:
+            if frame_idx == n_frames - 1:
+                continue
             matrix[b, frame_idx] = 1
 
     frame_times = (np.arange(n_frames) * HOP_SIZE + FRAME_SIZE / 2) / samplerate
