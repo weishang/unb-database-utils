@@ -3,6 +3,12 @@ import ctypes
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+# Lets this script (and its re-spawned worker processes, which invoke it via
+# __file__) resolve the repo-root-level common/ and config.py regardless of
+# how it's launched, since it lives one directory down in voicedtracks/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import soundfile as sf
@@ -65,7 +71,7 @@ def build_figure(data, samplerate, label):
 
     import matplotlib.pyplot as plt
 
-    fig, (ax_wave, ax_spec, ax_tracks) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    fig, (ax_wave, ax_spec) = plt.subplots(2, 1, figsize=(10, 6.5), sharex=True)
     fig.suptitle(label)
     if fig.canvas.manager is not None:
         fig.canvas.manager.set_window_title(label)
@@ -78,12 +84,9 @@ def build_figure(data, samplerate, label):
     hop = nfft // 2
     ax_spec.specgram(plot_data, Fs=samplerate, NFFT=nfft, noverlap=hop, cmap="magma")
     ax_spec.set_ylabel("Frequency (Hz)")
+    ax_spec.set_xlabel("Time (s)")
 
-    plot_pitch_track(ax_spec, plot_data, samplerate, frame_length=nfft, hop_length=hop)
-
-    plot_voiced_tracks(ax_tracks, plot_data, samplerate)
-    ax_tracks.set_ylabel("Frequency (Hz)")
-    ax_tracks.set_xlabel("Time (s)")
+    plot_voiced_tracks(ax_spec, plot_data, samplerate)
 
     fig.tight_layout()
     add_scroll_zoom(fig)
@@ -92,8 +95,9 @@ def build_figure(data, samplerate, label):
 
 def plot_voiced_tracks(ax, plot_data, samplerate):
     """Overlay the VoicedTracks feature set (Shang & Stevenson) as a scatter of
-    surviving harmonic-track points, matching tech_report.pdf's Figure 3.1."""
-    from voicedtracks.voiced_tracks import extract_voiced_tracks
+    surviving harmonic-track points on top of the spectrogram, matching
+    tech_report.pdf's Figure 3.1."""
+    from voiced_tracks import extract_voiced_tracks
 
     result = extract_voiced_tracks(plot_data, samplerate)
     bins_idx, frames_idx = np.nonzero(result["matrix"])
@@ -101,63 +105,7 @@ def plot_voiced_tracks(ax, plot_data, samplerate):
         return
 
     ax.scatter(result["frame_times"][frames_idx], result["freqs"][bins_idx],
-               s=4, color="black", marker=".")
-    ax.set_title("VoicedTracks feature set", fontsize=9)
-
-
-def estimate_pitch_track(plot_data, samplerate, frame_length, hop_length,
-                          fmin=60, fmax=500, voicing_threshold=0.35):
-    """Per-frame F0 via normalized autocorrelation, with a periodicity-strength
-    voicing gate. (librosa.pyin was tried first, but its trained voicing model
-    badly under-detects voicing on this dataset's 8 kHz telephony-band audio --
-    verified against a manual autocorrelation check that found clear ~75 Hz
-    periodicity in a segment pyin scored as ~0% voiced.)"""
-    n_frames = 1 + (len(plot_data) - frame_length) // hop_length
-    if n_frames < 1:
-        return np.array([]), np.array([])
-
-    min_lag = int(samplerate / fmax)
-    max_lag = min(int(samplerate / fmin), frame_length - 1)
-
-    times = np.arange(n_frames) * hop_length / samplerate + frame_length / (2 * samplerate)
-    f0 = np.full(n_frames, np.nan)
-
-    for i in range(n_frames):
-        start = i * hop_length
-        frame = plot_data[start:start + frame_length]
-        frame = frame - frame.mean()
-
-        energy = np.dot(frame, frame)
-        if energy < 1e-9:
-            continue  # silence
-
-        ac = np.correlate(frame, frame, mode="full")[len(frame) - 1:]
-        ac /= ac[0]
-
-        lag_range = ac[min_lag:max_lag]
-        if len(lag_range) == 0:
-            continue
-
-        peak_idx = int(np.argmax(lag_range))
-        peak_val = lag_range[peak_idx]
-        if peak_val >= voicing_threshold:
-            f0[i] = samplerate / (min_lag + peak_idx)
-
-    return times, f0
-
-
-def plot_pitch_track(ax, plot_data, samplerate, frame_length, hop_length):
-    """Overlay an estimated F0 (pitch) contour on a spectrogram axis."""
-    frame_length = min(frame_length, len(plot_data))
-    if frame_length < hop_length * 2:
-        return  # too short a recording to track pitch meaningfully
-
-    times, f0 = estimate_pitch_track(plot_data, samplerate, frame_length, hop_length)
-    if len(times) == 0:
-        return
-
-    ax.plot(times, f0, color="cyan", linewidth=1.5, label="F0 (pitch)")
-    ax.legend(loc="upper right", fontsize=8)
+               s=6, color="black", marker="o", zorder=2.5)
 
 
 def add_scroll_zoom(fig):
